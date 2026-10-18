@@ -674,3 +674,6 @@ export async function buildApp() {
   app.addHook('onClose', async () => { await prisma.$disconnect(); if (redis) await redis.quit().catch(() => redis.disconnect()); });
   return app;
 }
+
+// Vercel detects src/app.ts before src/index.ts; expose the configured Fastify server.
+export default await buildApp();
