@@ -1,116 +1,175 @@
-import { createHmac, timingSafeEqual } from 'node:crypto';
+import { createHash } from 'node:crypto';
 
-export class StripeRequestError extends Error {
-  constructor(readonly status: number | null, message = 'Stripe request failed') {
+export class PayPalRequestError extends Error {
+  constructor(readonly status: number | null, message = 'PayPal request failed') {
     super(message);
-    this.name = 'StripeRequestError';
+    this.name = 'PayPalRequestError';
   }
 }
 
-export type StripeEvent = {
-  id: string;
-  type: string;
-  data: { object: Record<string, unknown> };
-};
+export type PayPalCredentials = { clientId: string; clientSecret: string };
+export type PayPalOrder = Record<string, unknown>;
+export type PayPalWebhookEvent = { id: string; event_type: string; resource: Record<string, unknown> };
+type HeaderBag = Record<string, string | string[] | undefined>;
 
-export type CheckoutInput = {
-  secretKey: string;
-  priceId: string;
-  quantity: number;
-  purchaseId: string;
-  purchaseType: 'FAMILY_BASE' | 'EXTRA_SEATS';
-  ownerUserId: string;
-  familyId?: string;
-  successUrl: string;
-  cancelUrl: string;
-};
+const PAYPAL_API = 'https://api-m.sandbox.paypal.com';
 
-export type CheckoutResult = { id: string; url: string; expiresAt: Date };
-
-function isObject(value: unknown): value is Record<string, unknown> {
+function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-export function verifyStripeSignature(rawBody: Buffer, signatureHeader: string, secret: string, nowMs = Date.now()): StripeEvent {
-  const parts = signatureHeader.split(',').map(part => part.trim().split('=', 2));
-  const timestamp = parts.find(([key]) => key === 't')?.[1];
-  const signatures = parts.filter(([key]) => key === 'v1').map(([, value]) => value).filter((value): value is string => typeof value === 'string');
-  if (!timestamp || !/^\d+$/.test(timestamp) || signatures.length === 0) throw new Error('Invalid Stripe signature header');
-  const seconds = Number(timestamp);
-  if (!Number.isSafeInteger(seconds) || Math.abs(Math.floor(nowMs / 1000) - seconds) > 300) throw new Error('Stale Stripe signature');
-
-  const expected = createHmac('sha256', secret).update(Buffer.concat([Buffer.from(`${timestamp}.`, 'utf8'), rawBody])).digest();
-  const valid = signatures.some(signature => {
-    if (!/^[a-f0-9]{64}$/i.test(signature)) return false;
-    const provided = Buffer.from(signature, 'hex');
-    return provided.length === expected.length && timingSafeEqual(provided, expected);
-  });
-  if (!valid) throw new Error('Invalid Stripe signature');
-
-  let decoded: unknown;
-  try { decoded = JSON.parse(rawBody.toString('utf8')) as unknown; }
-  catch { throw new Error('Invalid Stripe event JSON'); }
-  if (!isObject(decoded) || typeof decoded.id !== 'string' || typeof decoded.type !== 'string' || !isObject(decoded.data) || !isObject(decoded.data.object)) {
-    throw new Error('Invalid Stripe event structure');
-  }
-  return decoded as StripeEvent;
+function idempotencyKey(action: string, value: string): string {
+  const digest = createHash('sha256').update(value).digest('hex').slice(0, 24);
+  return `cc-${action}-${digest}`;
 }
 
-async function stripeRequest<T>(secretKey: string, path: string, init?: RequestInit): Promise<T> {
+async function getAccessToken(credentials: PayPalCredentials): Promise<string> {
   let response: Response;
   try {
-    response = await fetch(`https://api.stripe.com/v1/${path}`, {
-      ...init,
+    response = await fetch(`${PAYPAL_API}/v1/oauth2/token`, {
+      method: 'POST',
       headers: {
-        authorization: `Bearer ${secretKey}`,
-        ...(init?.headers ?? {}),
+        authorization: `Basic ${Buffer.from(`${credentials.clientId}:${credentials.clientSecret}`).toString('base64')}`,
+        'content-type': 'application/x-www-form-urlencoded',
       },
-      signal: init?.signal ?? AbortSignal.timeout(10000),
+      body: new URLSearchParams({ grant_type: 'client_credentials' }),
+      signal: AbortSignal.timeout(10000),
     });
   } catch {
-    throw new StripeRequestError(null);
+    throw new PayPalRequestError(null);
   }
-  if (!response.ok) {
-    // Provider error bodies can include account details; don't propagate or log them.
-    throw new StripeRequestError(response.status);
+  if (!response.ok) throw new PayPalRequestError(response.status);
+  let payload: unknown;
+  try { payload = await response.json() as unknown; }
+  catch { throw new PayPalRequestError(response.status); }
+  if (!isRecord(payload) || typeof payload.access_token !== 'string' || payload.access_token.length < 20) {
+    throw new PayPalRequestError(502);
   }
+  return payload.access_token;
+}
+
+async function paypalRequest<T>(credentials: PayPalCredentials, path: string, init: RequestInit = {}): Promise<T> {
+  const token = await getAccessToken(credentials);
+  let response: Response;
+  try {
+    response = await fetch(`${PAYPAL_API}${path}`, {
+      ...init,
+      headers: {
+        authorization: `Bearer ${token}`,
+        ...(init.headers ?? {}),
+      },
+      signal: init.signal ?? AbortSignal.timeout(10000),
+    });
+  } catch {
+    throw new PayPalRequestError(null);
+  }
+  if (!response.ok) throw new PayPalRequestError(response.status);
+  if (response.status === 204) return undefined as T;
   try { return await response.json() as T; }
-  catch { throw new StripeRequestError(response.status); }
+  catch { throw new PayPalRequestError(response.status); }
 }
 
-export async function createCheckoutSession(input: CheckoutInput): Promise<CheckoutResult> {
-  const body = new URLSearchParams();
-  body.set('mode', 'payment');
-  body.set('line_items[0][price]', input.priceId);
-  body.set('line_items[0][quantity]', String(input.quantity));
-  body.set('success_url', input.successUrl);
-  body.set('cancel_url', input.cancelUrl);
-  body.set('client_reference_id', input.purchaseId);
-  body.set('metadata[purchaseId]', input.purchaseId);
-  body.set('metadata[purchaseType]', input.purchaseType);
-  body.set('metadata[ownerUserId]', input.ownerUserId);
-  body.set('payment_intent_data[metadata][purchaseId]', input.purchaseId);
-  body.set('payment_intent_data[metadata][purchaseType]', input.purchaseType);
-  body.set('payment_intent_data[metadata][ownerUserId]', input.ownerUserId);
-  if (input.familyId) {
-    body.set('metadata[familyId]', input.familyId);
-    body.set('payment_intent_data[metadata][familyId]', input.familyId);
+export async function createPayPalOrder(input: {
+  credentials: PayPalCredentials;
+  purchaseId: string;
+  description: string;
+  amount: string;
+  currency: string;
+  returnUrl: string;
+  cancelUrl: string;
+}): Promise<{ id: string; url: string }> {
+  if (!/^[A-Z]{3}$/.test(input.currency) || !/^(?:0|[1-9]\d{0,8})\.\d{2}$/.test(input.amount) || Number(input.amount) <= 0) {
+    throw new PayPalRequestError(400);
   }
-
-  const session = await stripeRequest<{ id?: unknown; url?: unknown; expires_at?: unknown }>(input.secretKey, 'checkout/sessions', {
+  const order = await paypalRequest<PayPalOrder>(input.credentials, '/v2/checkout/orders', {
     method: 'POST',
-    headers: { 'content-type': 'application/x-www-form-urlencoded', 'idempotency-key': `carecircle-purchase-${input.purchaseId}` },
-    body,
+    headers: {
+      'content-type': 'application/json',
+      'PayPal-Request-Id': idempotencyKey('create', input.purchaseId),
+      prefer: 'return=representation',
+    },
+    body: JSON.stringify({
+      intent: 'CAPTURE',
+      purchase_units: [{
+        reference_id: input.purchaseId,
+        custom_id: input.purchaseId,
+        invoice_id: input.purchaseId.slice(0, 127),
+        description: input.description.slice(0, 127),
+        amount: { currency_code: input.currency, value: input.amount },
+      }],
+      application_context: {
+        brand_name: 'CareCircle',
+        user_action: 'PAY_NOW',
+        return_url: input.returnUrl,
+        cancel_url: input.cancelUrl,
+      },
+    }),
   });
-  if (typeof session.id !== 'string' || typeof session.url !== 'string' || typeof session.expires_at !== 'number') {
-    throw new StripeRequestError(502);
+  const links = Array.isArray(order.links) ? order.links : [];
+  const approval = links.find(value => isRecord(value) && (value.rel === 'payer-action' || value.rel === 'approve'));
+  if (typeof order.id !== 'string' || !isRecord(approval) || typeof approval.href !== 'string') {
+    throw new PayPalRequestError(502);
   }
-  return { id: session.id, url: session.url, expiresAt: new Date(session.expires_at * 1000) };
+  return { id: order.id, url: approval.href };
 }
 
-export async function retrievePaymentIntentMetadata(secretKey: string, paymentIntentId: string): Promise<Record<string, string>> {
-  if (!/^pi_[A-Za-z0-9]+$/.test(paymentIntentId)) throw new StripeRequestError(400);
-  const intent = await stripeRequest<{ metadata?: unknown }>(secretKey, `payment_intents/${encodeURIComponent(paymentIntentId)}`);
-  if (!isObject(intent.metadata)) return {};
-  return Object.fromEntries(Object.entries(intent.metadata).filter((entry): entry is [string, string] => typeof entry[1] === 'string'));
+export async function capturePayPalOrder(credentials: PayPalCredentials, orderId: string): Promise<PayPalOrder> {
+  if (!/^[A-Za-z0-9-]{5,80}$/.test(orderId)) throw new PayPalRequestError(400);
+  return paypalRequest<PayPalOrder>(credentials, `/v2/checkout/orders/${encodeURIComponent(orderId)}/capture`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'PayPal-Request-Id': idempotencyKey('capture', orderId),
+      prefer: 'return=representation',
+    },
+    body: '{}',
+  });
+}
+
+export async function getPayPalOrder(credentials: PayPalCredentials, orderId: string): Promise<PayPalOrder> {
+  if (!/^[A-Za-z0-9-]{5,80}$/.test(orderId)) throw new PayPalRequestError(400);
+  return paypalRequest<PayPalOrder>(credentials, `/v2/checkout/orders/${encodeURIComponent(orderId)}`);
+}
+
+function header(headers: HeaderBag, name: string): string | null {
+  const value = headers[name.toLowerCase()];
+  return typeof value === 'string' ? value : null;
+}
+
+export async function verifyPayPalWebhook(
+  credentials: PayPalCredentials,
+  webhookId: string,
+  headers: HeaderBag,
+  untrustedEvent: unknown,
+): Promise<PayPalWebhookEvent | null> {
+  if (!isRecord(untrustedEvent) || typeof untrustedEvent.id !== 'string' ||
+      typeof untrustedEvent.event_type !== 'string' || !isRecord(untrustedEvent.resource)) return null;
+
+  const authAlgo = header(headers, 'paypal-auth-algo');
+  const certUrl = header(headers, 'paypal-cert-url');
+  const transmissionId = header(headers, 'paypal-transmission-id');
+  const transmissionSig = header(headers, 'paypal-transmission-sig');
+  const transmissionTime = header(headers, 'paypal-transmission-time');
+  if (!authAlgo || !certUrl || !transmissionId || !transmissionSig || !transmissionTime) return null;
+  try {
+    const certificate = new URL(certUrl);
+    if (certificate.protocol !== 'https:' ||
+        !['api-m.sandbox.paypal.com', 'api.sandbox.paypal.com'].includes(certificate.hostname)) return null;
+  } catch { return null; }
+
+  const verification = await paypalRequest<Record<string, unknown>>(credentials, '/v1/notifications/verify-webhook-signature', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      auth_algo: authAlgo,
+      cert_url: certUrl,
+      transmission_id: transmissionId,
+      transmission_sig: transmissionSig,
+      transmission_time: transmissionTime,
+      webhook_id: webhookId,
+      webhook_event: untrustedEvent,
+    }),
+  });
+  if (verification.verification_status !== 'SUCCESS') return null;
+  return untrustedEvent as PayPalWebhookEvent;
 }

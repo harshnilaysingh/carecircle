@@ -39,6 +39,11 @@ enum PurchaseStatus {
   REFUNDED
 }
 
+enum BillingProvider {
+  STRIPE
+  PAYPAL
+}
+
 enum RecordKind {
   TASK
   DAILY_UPDATE
@@ -133,8 +138,9 @@ model BillingPurchase {
   familyId              String?
   seatQuantity          Int
   baseCheckoutOwnerId   String?        @unique
-  stripeCheckoutSessionId String?      @unique @db.VarChar(255)
-  stripePaymentIntentId String?        @unique @db.VarChar(255)
+  provider               BillingProvider @default(PAYPAL)
+  providerOrderId        String?         @unique @db.VarChar(255) @map("provider_order_id")
+  providerPaymentId      String?         @unique @db.VarChar(255) @map("provider_payment_id")
   checkoutUrl           String?        @db.Text
   checkoutExpiresAt     DateTime?
   createdAt             DateTime       @default(now())
@@ -146,12 +152,13 @@ model BillingPurchase {
   @@map("billing_purchases")
 }
 
-model StripeWebhookEvent {
-  id        String   @id @db.VarChar(255)
-  eventType String   @db.VarChar(120)
-  createdAt DateTime @default(now())
+model BillingWebhookEvent {
+  id        String          @id @db.VarChar(255)
+  provider  BillingProvider @default(PAYPAL)
+  eventType String          @db.VarChar(120)
+  createdAt DateTime        @default(now())
   @@index([createdAt])
-  @@map("stripe_webhook_events")
+  @@map("billing_webhook_events")
 }
 
 model CareRecord {

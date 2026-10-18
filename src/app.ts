@@ -6,13 +6,13 @@ import rateLimit from '@fastify/rate-limit';
 import argon2 from 'argon2';
 import { Redis } from 'ioredis';
 import { z } from 'zod';
-import { Prisma, PrismaClient, FamilyRole, FamilyStatus, InviteStatus, PurchaseStatus, PurchaseType, RecordKind } from '@prisma/client';
+import { Prisma, PrismaClient, BillingProvider, FamilyRole, FamilyStatus, InviteStatus, PurchaseStatus, PurchaseType, RecordKind } from '@prisma/client';
 import { config } from './config.js';
 import { clearSessionCookie, digest, newToken, requireSameOrigin, setSessionCookie } from './security.js';
-import { createCheckoutSession, retrievePaymentIntentMetadata, StripeRequestError, verifyStripeSignature, type StripeEvent } from './payments.js';
+import { capturePayPalOrder, createPayPalOrder, getPayPalOrder, PayPalRequestError, verifyPayPalWebhook, type PayPalCredentials, type PayPalOrder, type PayPalWebhookEvent } from './payments.js';
 
 const prisma = new PrismaClient({ log: config.NODE_ENV === 'development' ? ['warn', 'error'] : ['error'] });
-declare module 'fastify' { interface FastifyRequest { userId?: string; rawBody?: Buffer; } }
+declare module 'fastify' { interface FastifyRequest { userId?: string; } }
 
 const emailSchema = z.string().trim().email().max(320).transform(v => v.toLowerCase());
 const registration = z.object({ email: emailSchema, password: z.string().min(12).max(128), displayName: z.string().trim().min(1).max(120), inviteCode: z.string().min(32).max(128).optional() }).strict();
@@ -61,20 +61,22 @@ async function acceptInviteInTransaction(tx: Prisma.TransactionClient, userId: s
   return { familyId: family.id };
 }
 
-function stripeObject(value: unknown): Record<string, unknown> | null {
+function asRecord(value: unknown): Record<string, unknown> | null {
   return typeof value === 'object' && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : null;
 }
 
-function stripeId(value: unknown): string | null {
-  if (typeof value === 'string') return value;
-  const record = stripeObject(value);
-  return record && typeof record.id === 'string' ? record.id : null;
+function textValue(value: unknown): string | null {
+  return typeof value === 'string' ? value : null;
 }
 
-function stripeMetadata(value: unknown): Record<string, string> {
-  const record = stripeObject(value);
-  if (!record) return {};
-  return Object.fromEntries(Object.entries(record).filter((entry): entry is [string, string] => typeof entry[1] === 'string'));
+function amountCents(value: string): number {
+  const [whole, fraction = ''] = value.split('.');
+  return Number(whole) * 100 + Number(fraction.padEnd(2, '0'));
+}
+
+function amountForQuantity(unitAmount: string, quantity: number): string {
+  const total = amountCents(unitAmount) * quantity;
+  return `${Math.floor(total / 100)}.${String(total % 100).padStart(2, '0')}`;
 }
 
 export async function buildApp() {
@@ -88,7 +90,7 @@ export async function buildApp() {
 
   app.addHook('onRequest', async (request, reply) => {
     reply.header('Cache-Control', 'no-store');
-    if (['POST', 'PATCH', 'DELETE'].includes(request.method) && request.url !== '/api/auth/login' && request.url !== '/api/auth/register' && request.url !== '/api/auth/invitations/accept' && request.url !== '/api/billing/stripe/webhook' && !requireSameOrigin(request)) {
+    if (['POST', 'PATCH', 'DELETE'].includes(request.method) && request.url !== '/api/auth/login' && request.url !== '/api/auth/register' && request.url !== '/api/auth/invitations/accept' && !request.url.startsWith('/api/billing/paypal/webhook') && !requireSameOrigin(request)) {
       await fail(reply, 403, 'ORIGIN_REJECTED');
     }
   });
@@ -216,6 +218,7 @@ export async function buildApp() {
     const member = await membership(request, reply, familyId); if (!member) return;
     if (member.role !== FamilyRole.OWNER) return fail(reply, 403, 'ROLE_FORBIDDEN');
     const input = invitationInput.parse(request.body);
+    if (config.NODE_ENV === 'production' && (!config.RESEND_API_KEY || !config.EMAIL_FROM)) return fail(reply, 503, 'INVITATION_DELIVERY_NOT_CONFIGURED');
     const { invite, inviteUrl } = await createInvite(familyId, request.userId!, input.role as FamilyRole, request.id, input.email);
     if (config.NODE_ENV === 'production') {
       try {
@@ -320,8 +323,130 @@ export async function buildApp() {
     return { user: result.user, familyId: result.familyId };
   });
 
+  const paypalCredentials = (): PayPalCredentials | null => config.PAYPAL_CLIENT_ID && config.PAYPAL_CLIENT_SECRET
+    ? { clientId: config.PAYPAL_CLIENT_ID, clientSecret: config.PAYPAL_CLIENT_SECRET }
+    : null;
+  const paypalBillingConfigured = () => Boolean(
+    paypalCredentials() && config.PAYPAL_WEBHOOK_ID && config.PAYPAL_CURRENCY &&
+    config.PAYPAL_FAMILY_BASE_AMOUNT && config.PAYPAL_EXTRA_SEAT_AMOUNT && config.API_PUBLIC_URL
+  );
+  const appBillingRedirect = (reply: FastifyReply, status: 'success' | 'cancelled' | 'failed' | 'processing') => {
+    const target = new URL(config.PUBLIC_APP_URL);
+    target.searchParams.set('billing', status);
+    return reply.code(303).header('location', target.toString()).send();
+  };
+
+  const applyCompletedPayPalOrder = async (tx: Prisma.TransactionClient, untrustedOrder: PayPalOrder): Promise<boolean> => {
+    const order = asRecord(untrustedOrder);
+    const orderId = textValue(order?.id);
+    const purchaseUnits = Array.isArray(order?.purchase_units) ? order.purchase_units : [];
+    const unit = asRecord(purchaseUnits[0]);
+    const purchaseId = textValue(unit?.reference_id) ?? textValue(unit?.custom_id);
+    const orderAmount = asRecord(unit?.amount);
+    const payments = asRecord(unit?.payments);
+    const captures = Array.isArray(payments?.captures) ? payments.captures : [];
+    const capture = captures.map(asRecord).find(item => item?.status === 'COMPLETED') ?? null;
+    const captureId = textValue(capture?.id);
+    const captureAmount = asRecord(capture?.amount);
+    if (!orderId || !purchaseId || !captureId || order?.status !== 'COMPLETED') return false;
+    if (!config.PAYPAL_CURRENCY || !config.PAYPAL_FAMILY_BASE_AMOUNT || !config.PAYPAL_EXTRA_SEAT_AMOUNT) return false;
+    if (textValue(orderAmount?.currency_code) !== config.PAYPAL_CURRENCY ||
+        textValue(captureAmount?.currency_code) !== config.PAYPAL_CURRENCY) return false;
+
+    await tx.$queryRaw<Array<{ id: string }>>`SELECT "id" FROM "billing_purchases" WHERE "id" = ${purchaseId} FOR UPDATE`;
+    const purchase = await tx.billingPurchase.findUnique({ where: { id: purchaseId } });
+    if (!purchase || purchase.provider !== BillingProvider.PAYPAL ||
+        purchase.providerOrderId !== orderId) return false;
+    const unitPrice = purchase.type === PurchaseType.FAMILY_BASE ? config.PAYPAL_FAMILY_BASE_AMOUNT : config.PAYPAL_EXTRA_SEAT_AMOUNT;
+    const expectedAmount = amountForQuantity(unitPrice, purchase.type === PurchaseType.FAMILY_BASE ? 1 : purchase.seatQuantity);
+    if (textValue(orderAmount?.value) !== expectedAmount || textValue(captureAmount?.value) !== expectedAmount) return false;
+    if (purchase.status === PurchaseStatus.COMPLETED) return purchase.providerPaymentId === captureId;
+    if (purchase.status !== PurchaseStatus.PENDING) return false;
+
+    if (purchase.type === PurchaseType.FAMILY_BASE) {
+      let family = await tx.family.findUnique({ where: { ownerId: purchase.userId } });
+      if (family?.status === FamilyStatus.ACTIVE) {
+        await tx.billingPurchase.update({ where: { id: purchase.id }, data: { status: PurchaseStatus.FAILED, baseCheckoutOwnerId: null, providerPaymentId: captureId } });
+        return false;
+      }
+      const user = await tx.user.findUniqueOrThrow({ where: { id: purchase.userId }, select: { displayName: true } });
+      const priorMembership = await tx.familyMember.findUnique({ where: { userId: purchase.userId } });
+      if (priorMembership && (!family || priorMembership.familyId !== family.id)) {
+        await tx.billingPurchase.update({ where: { id: purchase.id }, data: { status: PurchaseStatus.FAILED, baseCheckoutOwnerId: null, providerPaymentId: captureId } });
+        return false;
+      }
+      if (!family) {
+        family = await tx.family.create({
+          data: {
+            name: `${user.displayName}'s family`,
+            ownerId: purchase.userId,
+            seatLimit: 4,
+            status: FamilyStatus.ACTIVE,
+            memberships: { create: { userId: purchase.userId, role: FamilyRole.OWNER } },
+          },
+        });
+      } else {
+        const paidExtraSeats = await tx.billingPurchase.aggregate({
+          where: { familyId: family.id, type: PurchaseType.EXTRA_SEATS, status: PurchaseStatus.COMPLETED },
+          _sum: { seatQuantity: true },
+        });
+        family = await tx.family.update({
+          where: { id: family.id },
+          data: { status: FamilyStatus.ACTIVE, seatLimit: 4 + (paidExtraSeats._sum.seatQuantity ?? 0) },
+        });
+        if (priorMembership) await tx.familyMember.update({ where: { id: priorMembership.id }, data: { role: FamilyRole.OWNER } });
+        else await tx.familyMember.create({ data: { familyId: family.id, userId: purchase.userId, role: FamilyRole.OWNER } });
+      }
+      await tx.billingPurchase.update({
+        where: { id: purchase.id },
+        data: { status: PurchaseStatus.COMPLETED, familyId: family.id, baseCheckoutOwnerId: null, providerPaymentId: captureId },
+      });
+      await tx.auditEvent.create({ data: { actorId: purchase.userId, action: 'billing.family.activated', familyId: family.id, subjectType: 'billing_purchase', subjectId: purchase.id } });
+      return true;
+    }
+
+    if (!purchase.familyId) return false;
+    const family = await tx.family.findUnique({ where: { id: purchase.familyId }, select: { id: true, ownerId: true, status: true } });
+    if (!family || family.ownerId !== purchase.userId || family.status !== FamilyStatus.ACTIVE) {
+      await tx.billingPurchase.update({ where: { id: purchase.id }, data: { status: PurchaseStatus.FAILED, providerPaymentId: captureId } });
+      return false;
+    }
+    await tx.family.update({ where: { id: family.id }, data: { seatLimit: { increment: purchase.seatQuantity } } });
+    await tx.billingPurchase.update({ where: { id: purchase.id }, data: { status: PurchaseStatus.COMPLETED, providerPaymentId: captureId } });
+    await tx.auditEvent.create({ data: { actorId: purchase.userId, action: 'billing.family.seats_added', familyId: family.id, subjectType: 'billing_purchase', subjectId: purchase.id } });
+    return true;
+  };
+
+  const processPayPalWebhook = async (event: PayPalWebhookEvent, order?: PayPalOrder, refundCaptureId?: string, refundOrderId?: string) => {
+    try {
+      await prisma.$transaction(async tx => {
+        if (await tx.billingWebhookEvent.findUnique({ where: { id: event.id }, select: { id: true } })) return;
+        await tx.billingWebhookEvent.create({ data: { id: event.id, provider: BillingProvider.PAYPAL, eventType: event.event_type } });
+        if (order) await applyCompletedPayPalOrder(tx, order);
+        if (refundCaptureId || refundOrderId) {
+          const purchase = await tx.billingPurchase.findFirst({
+            where: { OR: [
+              ...(refundCaptureId ? [{ providerPaymentId: refundCaptureId }] : []),
+              ...(refundOrderId ? [{ providerOrderId: refundOrderId }] : []),
+            ] },
+          });
+          if (!purchase) return;
+          await tx.billingPurchase.update({ where: { id: purchase.id }, data: { status: PurchaseStatus.REFUNDED, baseCheckoutOwnerId: null } });
+          if (purchase.familyId) await tx.family.updateMany({ where: { id: purchase.familyId }, data: { status: FamilyStatus.INACTIVE } });
+          await tx.auditEvent.create({ data: { actorId: null, action: 'billing.family.refunded', ...(purchase.familyId ? { familyId: purchase.familyId } : {}), subjectType: 'billing_purchase', subjectId: purchase.id } });
+        }
+      });
+      return true;
+    } catch (error) {
+      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002' &&
+          await prisma.billingWebhookEvent.findUnique({ where: { id: event.id }, select: { id: true } })) return false;
+      throw error;
+    }
+  };
+
   app.post('/api/billing/family/base-checkout', { preHandler: auth, config: { rateLimit: { max: 5, timeWindow: '1 hour' } } }, async (request, reply) => {
-    if (!config.STRIPE_SECRET_KEY || !config.STRIPE_BASE_PRICE_ID) return fail(reply, 503, 'BILLING_NOT_CONFIGURED');
+    if (!paypalBillingConfigured()) return fail(reply, 503, 'BILLING_NOT_CONFIGURED');
+    const credentials = paypalCredentials()!;
     const existingMembership = await prisma.familyMember.findUnique({ where: { userId: request.userId! }, include: { family: { select: { id: true, ownerId: true, status: true } } } });
     if (existingMembership && (existingMembership.role !== FamilyRole.OWNER || existingMembership.family.ownerId !== request.userId)) return fail(reply, 409, 'ALREADY_IN_FAMILY');
     if (existingMembership?.family.status === FamilyStatus.ACTIVE) return fail(reply, 409, 'FAMILY_ALREADY_ACTIVE');
@@ -329,7 +454,10 @@ export async function buildApp() {
     if (ownedFamily?.status === FamilyStatus.ACTIVE) return fail(reply, 409, 'FAMILY_ALREADY_ACTIVE');
 
     const now = new Date();
-    let purchase = await prisma.billingPurchase.findFirst({ where: { baseCheckoutOwnerId: request.userId!, status: PurchaseStatus.PENDING }, orderBy: { createdAt: 'desc' } });
+    let purchase = await prisma.billingPurchase.findFirst({
+      where: { baseCheckoutOwnerId: request.userId!, status: PurchaseStatus.PENDING, provider: BillingProvider.PAYPAL },
+      orderBy: { createdAt: 'desc' },
+    });
     if (purchase?.checkoutExpiresAt && purchase.checkoutExpiresAt <= now) {
       await prisma.billingPurchase.update({ where: { id: purchase.id }, data: { status: PurchaseStatus.EXPIRED, baseCheckoutOwnerId: null } });
       purchase = null;
@@ -339,10 +467,22 @@ export async function buildApp() {
     }
     if (!purchase) {
       try {
-        purchase = await prisma.billingPurchase.create({ data: { type: PurchaseType.FAMILY_BASE, status: PurchaseStatus.PENDING, userId: request.userId!, familyId: ownedFamily?.id ?? null, seatQuantity: 4, baseCheckoutOwnerId: request.userId! } });
+        purchase = await prisma.billingPurchase.create({
+          data: {
+            type: PurchaseType.FAMILY_BASE,
+            status: PurchaseStatus.PENDING,
+            provider: BillingProvider.PAYPAL,
+            userId: request.userId!,
+            familyId: ownedFamily?.id ?? null,
+            seatQuantity: 4,
+            baseCheckoutOwnerId: request.userId!,
+          },
+        });
       } catch (error) {
         if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
-          const concurrent = await prisma.billingPurchase.findFirst({ where: { baseCheckoutOwnerId: request.userId!, status: PurchaseStatus.PENDING } });
+          const concurrent = await prisma.billingPurchase.findFirst({
+            where: { baseCheckoutOwnerId: request.userId!, status: PurchaseStatus.PENDING, provider: BillingProvider.PAYPAL },
+          });
           if (concurrent?.checkoutUrl) return { checkoutUrl: concurrent.checkoutUrl, purchaseId: concurrent.id, reused: true };
           return fail(reply, 409, 'CHECKOUT_PENDING');
         }
@@ -351,22 +491,24 @@ export async function buildApp() {
     }
 
     try {
-      const session = await createCheckoutSession({
-        secretKey: config.STRIPE_SECRET_KEY,
-        priceId: config.STRIPE_BASE_PRICE_ID,
-        quantity: 1,
+      const order = await createPayPalOrder({
+        credentials,
         purchaseId: purchase.id,
-        purchaseType: 'FAMILY_BASE',
-        ownerUserId: request.userId!,
-        ...(ownedFamily ? { familyId: ownedFamily.id } : {}),
-        successUrl: config.STRIPE_SUCCESS_URL ?? `${config.PUBLIC_APP_URL}/?billing=success&session_id={CHECKOUT_SESSION_ID}`,
-        cancelUrl: config.STRIPE_CANCEL_URL ?? `${config.PUBLIC_APP_URL}/?billing=cancelled`,
+        description: 'CareCircle family plan',
+        amount: amountForQuantity(config.PAYPAL_FAMILY_BASE_AMOUNT!, 1),
+        currency: config.PAYPAL_CURRENCY!,
+        returnUrl: `${config.API_PUBLIC_URL!.replace(/\/+$/, '')}/api/billing/paypal/return`,
+        cancelUrl: `${config.API_PUBLIC_URL!.replace(/\/+$/, '')}/api/billing/paypal/cancel`,
       });
-      await prisma.billingPurchase.update({ where: { id: purchase.id }, data: { stripeCheckoutSessionId: session.id, checkoutUrl: session.url, checkoutExpiresAt: session.expiresAt } });
-      return { checkoutUrl: session.url, purchaseId: purchase.id, reused: false };
+      const checkoutExpiresAt = new Date(Date.now() + 3 * 60 * 60 * 1000);
+      await prisma.billingPurchase.update({
+        where: { id: purchase.id },
+        data: { providerOrderId: order.id, checkoutUrl: order.url, checkoutExpiresAt },
+      });
+      return { checkoutUrl: order.url, purchaseId: purchase.id, reused: false };
     } catch (error) {
-      request.log.error({ requestId: request.id, errorName: error instanceof Error ? error.name : 'unknown', stripeStatus: error instanceof StripeRequestError ? error.status : undefined }, 'family checkout creation failed');
-      if (error instanceof StripeRequestError && error.status !== null && error.status >= 400 && error.status < 500) {
+      request.log.error({ requestId: request.id, errorName: error instanceof Error ? error.name : 'unknown', paypalStatus: error instanceof PayPalRequestError ? error.status : undefined }, 'family PayPal order creation failed');
+      if (error instanceof PayPalRequestError && error.status !== null && error.status >= 400 && error.status < 500) {
         await prisma.billingPurchase.updateMany({ where: { id: purchase.id, status: PurchaseStatus.PENDING }, data: { status: PurchaseStatus.FAILED, baseCheckoutOwnerId: null } });
       }
       return fail(reply, 503, 'PAYMENT_PROVIDER_UNAVAILABLE');
@@ -374,7 +516,8 @@ export async function buildApp() {
   });
 
   app.post('/api/families/:familyId/billing/extra-seats-checkout', { preHandler: auth, config: { rateLimit: { max: 10, timeWindow: '1 hour' } } }, async (request, reply) => {
-    if (!config.STRIPE_SECRET_KEY || !config.STRIPE_EXTRA_SEAT_PRICE_ID) return fail(reply, 503, 'BILLING_NOT_CONFIGURED');
+    if (!paypalBillingConfigured()) return fail(reply, 503, 'BILLING_NOT_CONFIGURED');
+    const credentials = paypalCredentials()!;
     const { familyId } = request.params as { familyId: string };
     const member = await membership(request, reply, familyId); if (!member) return;
     if (member.role !== FamilyRole.OWNER) return fail(reply, 403, 'ROLE_FORBIDDEN');
@@ -383,153 +526,101 @@ export async function buildApp() {
     if (family.ownerId !== request.userId) return fail(reply, 403, 'ROLE_FORBIDDEN');
     let purchase;
     try {
-      purchase = await prisma.billingPurchase.create({ data: { type: PurchaseType.EXTRA_SEATS, status: PurchaseStatus.PENDING, userId: request.userId!, familyId, seatQuantity: quantity } });
+      purchase = await prisma.billingPurchase.create({
+        data: { type: PurchaseType.EXTRA_SEATS, status: PurchaseStatus.PENDING, provider: BillingProvider.PAYPAL, userId: request.userId!, familyId, seatQuantity: quantity },
+      });
     } catch (error) {
-      request.log.error({ requestId: request.id, errorName: error instanceof Error ? error.name : 'unknown' }, 'extra seat order creation failed');
+      request.log.error({ requestId: request.id, errorName: error instanceof Error ? error.name : 'unknown' }, 'extra seat purchase creation failed');
       return fail(reply, 503, 'PAYMENT_ORDER_UNAVAILABLE');
     }
     try {
-      const session = await createCheckoutSession({
-        secretKey: config.STRIPE_SECRET_KEY,
-        priceId: config.STRIPE_EXTRA_SEAT_PRICE_ID,
-        quantity,
+      const order = await createPayPalOrder({
+        credentials,
         purchaseId: purchase.id,
-        purchaseType: 'EXTRA_SEATS',
-        ownerUserId: request.userId!,
-        familyId,
-        successUrl: config.STRIPE_SUCCESS_URL ?? `${config.PUBLIC_APP_URL}/?billing=success&session_id={CHECKOUT_SESSION_ID}`,
-        cancelUrl: config.STRIPE_CANCEL_URL ?? `${config.PUBLIC_APP_URL}/?billing=cancelled`,
+        description: `CareCircle extra family seats (${quantity})`,
+        amount: amountForQuantity(config.PAYPAL_EXTRA_SEAT_AMOUNT!, quantity),
+        currency: config.PAYPAL_CURRENCY!,
+        returnUrl: `${config.API_PUBLIC_URL!.replace(/\/+$/, '')}/api/billing/paypal/return`,
+        cancelUrl: `${config.API_PUBLIC_URL!.replace(/\/+$/, '')}/api/billing/paypal/cancel`,
       });
-      await prisma.billingPurchase.update({ where: { id: purchase.id }, data: { stripeCheckoutSessionId: session.id, checkoutUrl: session.url, checkoutExpiresAt: session.expiresAt } });
-      return { checkoutUrl: session.url, purchaseId: purchase.id, quantity };
+      const checkoutExpiresAt = new Date(Date.now() + 3 * 60 * 60 * 1000);
+      await prisma.billingPurchase.update({
+        where: { id: purchase.id },
+        data: { providerOrderId: order.id, checkoutUrl: order.url, checkoutExpiresAt },
+      });
+      return { checkoutUrl: order.url, purchaseId: purchase.id, quantity };
     } catch (error) {
-      request.log.error({ requestId: request.id, errorName: error instanceof Error ? error.name : 'unknown', stripeStatus: error instanceof StripeRequestError ? error.status : undefined }, 'extra seat checkout creation failed');
-      if (error instanceof StripeRequestError && error.status !== null && error.status >= 400 && error.status < 500) {
+      request.log.error({ requestId: request.id, errorName: error instanceof Error ? error.name : 'unknown', paypalStatus: error instanceof PayPalRequestError ? error.status : undefined }, 'extra seat PayPal order creation failed');
+      if (error instanceof PayPalRequestError && error.status !== null && error.status >= 400 && error.status < 500) {
         await prisma.billingPurchase.updateMany({ where: { id: purchase.id, status: PurchaseStatus.PENDING }, data: { status: PurchaseStatus.FAILED } });
       }
       return fail(reply, 503, 'PAYMENT_PROVIDER_UNAVAILABLE');
     }
   });
 
-  const processStripeEvent = async (event: StripeEvent, refundPurchaseId?: string, refundPaymentIntentId?: string) => {
+  app.get('/api/billing/paypal/return', async (request, reply) => {
+    if (!paypalBillingConfigured()) return appBillingRedirect(reply, 'processing');
+    const query = z.object({ token: z.string().min(5).max(80) }).safeParse(request.query);
+    if (!query.success) return appBillingRedirect(reply, 'failed');
+    const purchase = await prisma.billingPurchase.findUnique({ where: { providerOrderId: query.data.token } });
+    if (!purchase || purchase.provider !== BillingProvider.PAYPAL) return appBillingRedirect(reply, 'failed');
+    if (purchase.status === PurchaseStatus.COMPLETED) return appBillingRedirect(reply, 'success');
+    if (purchase.status !== PurchaseStatus.PENDING) return appBillingRedirect(reply, 'failed');
+
+    let order: PayPalOrder;
     try {
-      await prisma.$transaction(async tx => {
-        if (await tx.stripeWebhookEvent.findUnique({ where: { id: event.id }, select: { id: true } })) return;
-        await tx.stripeWebhookEvent.create({ data: { id: event.id, eventType: event.type } });
-        const object = event.data.object;
-        const metadata = stripeMetadata(object.metadata);
-        const checkoutEvent = event.type === 'checkout.session.completed' || event.type === 'checkout.session.async_payment_succeeded';
-        if (checkoutEvent) {
-          const purchaseId = metadata.purchaseId;
-          const sessionId = typeof object.id === 'string' ? object.id : null;
-          const piId = stripeId(object.payment_intent);
-          if (!purchaseId || !sessionId || (typeof object.client_reference_id === 'string' && object.client_reference_id !== purchaseId)) return;
-          const purchase = await tx.billingPurchase.findUnique({ where: { id: purchaseId } });
-          if (!purchase || purchase.status !== PurchaseStatus.PENDING || (purchase.stripeCheckoutSessionId && purchase.stripeCheckoutSessionId !== sessionId) || purchase.userId !== metadata.ownerUserId) return;
-          if (event.type === 'checkout.session.completed' && object.payment_status !== 'paid') {
-            await tx.billingPurchase.update({ where: { id: purchase.id }, data: { stripeCheckoutSessionId: sessionId, ...(piId ? { stripePaymentIntentId: piId } : {}) } });
-            return;
-          }
-          if (purchase.type === PurchaseType.FAMILY_BASE && metadata.purchaseType === 'FAMILY_BASE') {
-            let family = await tx.family.findUnique({ where: { ownerId: purchase.userId } });
-            if (family?.status === FamilyStatus.ACTIVE) {
-              await tx.billingPurchase.update({ where: { id: purchase.id }, data: { status: PurchaseStatus.FAILED, baseCheckoutOwnerId: null } });
-              return;
-            }
-            const user = await tx.user.findUniqueOrThrow({ where: { id: purchase.userId }, select: { displayName: true } });
-            if (!family) {
-              family = await tx.family.create({ data: { name: `${user.displayName}'s family`, ownerId: purchase.userId, seatLimit: 4, status: FamilyStatus.ACTIVE, memberships: { create: { userId: purchase.userId, role: FamilyRole.OWNER } } } });
-            } else {
-              const priorMembership = await tx.familyMember.findUnique({ where: { userId: purchase.userId } });
-              if (priorMembership && priorMembership.familyId !== family.id) {
-                await tx.billingPurchase.update({ where: { id: purchase.id }, data: { status: PurchaseStatus.FAILED, baseCheckoutOwnerId: null } });
-                return;
-              }
-              const paidExtraSeats = await tx.billingPurchase.aggregate({ where: { familyId: family.id, type: PurchaseType.EXTRA_SEATS, status: PurchaseStatus.COMPLETED }, _sum: { seatQuantity: true } });
-              family = await tx.family.update({ where: { id: family.id }, data: { status: FamilyStatus.ACTIVE, seatLimit: 4 + (paidExtraSeats._sum.seatQuantity ?? 0) } });
-              if (priorMembership) await tx.familyMember.update({ where: { id: priorMembership.id }, data: { role: FamilyRole.OWNER } });
-              else await tx.familyMember.create({ data: { familyId: family.id, userId: purchase.userId, role: FamilyRole.OWNER } });
-            }
-            await tx.billingPurchase.update({ where: { id: purchase.id }, data: { status: PurchaseStatus.COMPLETED, familyId: family.id, baseCheckoutOwnerId: null, stripeCheckoutSessionId: sessionId, ...(piId ? { stripePaymentIntentId: piId } : {}) } });
-            await tx.auditEvent.create({ data: { actorId: purchase.userId, action: 'billing.family.activated', familyId: family.id, subjectType: 'billing_purchase', subjectId: purchase.id } });
-          } else if (purchase.type === PurchaseType.EXTRA_SEATS && metadata.purchaseType === 'EXTRA_SEATS' && purchase.familyId) {
-            const family = await tx.family.findUnique({ where: { id: purchase.familyId }, select: { id: true, ownerId: true, status: true } });
-            if (!family || family.ownerId !== purchase.userId || family.status !== FamilyStatus.ACTIVE) {
-              await tx.billingPurchase.update({ where: { id: purchase.id }, data: { status: PurchaseStatus.FAILED } });
-              return;
-            }
-            await tx.family.update({ where: { id: family.id }, data: { seatLimit: { increment: purchase.seatQuantity } } });
-            await tx.billingPurchase.update({ where: { id: purchase.id }, data: { status: PurchaseStatus.COMPLETED, stripeCheckoutSessionId: sessionId, ...(piId ? { stripePaymentIntentId: piId } : {}) } });
-            await tx.auditEvent.create({ data: { actorId: purchase.userId, action: 'billing.family.seats_added', familyId: family.id, subjectType: 'billing_purchase', subjectId: purchase.id } });
-          }
-          return;
-        }
-
-        if (event.type === 'checkout.session.expired' || event.type === 'checkout.session.async_payment_failed') {
-          const purchaseId = metadata.purchaseId;
-          if (purchaseId) await tx.billingPurchase.updateMany({ where: { id: purchaseId, status: PurchaseStatus.PENDING }, data: { status: event.type.endsWith('.expired') ? PurchaseStatus.EXPIRED : PurchaseStatus.FAILED, baseCheckoutOwnerId: null } });
-          return;
-        }
-
-        if (event.type === 'charge.refunded' || event.type === 'refund.created') {
-          const purchaseId = refundPurchaseId ?? metadata.purchaseId;
-          const piId = refundPaymentIntentId ?? stripeId(object.payment_intent);
-          if (!purchaseId) return;
-          const purchase = await tx.billingPurchase.findUnique({ where: { id: purchaseId } });
-          if (!purchase) return;
-          await tx.billingPurchase.update({ where: { id: purchase.id }, data: { status: PurchaseStatus.REFUNDED, baseCheckoutOwnerId: null, ...(piId ? { stripePaymentIntentId: piId } : {}) } });
-          if (purchase.familyId) await tx.family.updateMany({ where: { id: purchase.familyId }, data: { status: FamilyStatus.INACTIVE } });
-          await tx.auditEvent.create({ data: { actorId: null, action: 'billing.family.refunded', ...(purchase.familyId ? { familyId: purchase.familyId } : {}), subjectType: 'billing_purchase', subjectId: purchase.id } });
-        }
-      });
-      return true;
+      try { order = await capturePayPalOrder(paypalCredentials()!, query.data.token); }
+      catch { order = await getPayPalOrder(paypalCredentials()!, query.data.token); }
+      const applied = await prisma.$transaction(tx => applyCompletedPayPalOrder(tx, order));
+      return appBillingRedirect(reply, applied ? 'success' : 'processing');
     } catch (error) {
-      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
-        if (await prisma.stripeWebhookEvent.findUnique({ where: { id: event.id }, select: { id: true } })) return false;
-      }
-      throw error;
+      request.log.error({ requestId: request.id, errorName: error instanceof Error ? error.name : 'unknown', paypalStatus: error instanceof PayPalRequestError ? error.status : undefined }, 'PayPal return capture failed');
+      return appBillingRedirect(reply, 'processing');
     }
-  };
+  });
 
-  await app.register(async webhookScope => {
-    webhookScope.removeContentTypeParser('application/json');
-    webhookScope.addContentTypeParser('application/json', { parseAs: 'buffer' }, (request, body, done) => {
-      const rawBody = Buffer.isBuffer(body) ? body : Buffer.from(body);
-      request.rawBody = rawBody;
-      try { done(null, JSON.parse(rawBody.toString('utf8')) as unknown); }
-      catch (error) { done(error instanceof Error ? error : new Error('Invalid JSON')); }
-    });
-    webhookScope.post('/api/billing/stripe/webhook', { config: { rateLimit: { max: 300, timeWindow: '1 minute' } } }, async (request, reply) => {
-      if (!config.STRIPE_WEBHOOK_SECRET || !config.STRIPE_SECRET_KEY) return fail(reply, 503, 'BILLING_NOT_CONFIGURED');
-      const signature = request.headers['stripe-signature'];
-      if (typeof signature !== 'string' || !request.rawBody) return fail(reply, 400, 'WEBHOOK_SIGNATURE_INVALID');
-      let event: StripeEvent;
-      try { event = verifyStripeSignature(request.rawBody, signature, config.STRIPE_WEBHOOK_SECRET); }
-      catch { return fail(reply, 400, 'WEBHOOK_SIGNATURE_INVALID'); }
-      let refundPurchaseId: string | undefined;
-      let refundPaymentIntentId: string | undefined;
-      if (event.type === 'charge.refunded' || event.type === 'refund.created') {
-        const object = event.data.object;
-        const metadata = stripeMetadata(object.metadata);
-        refundPurchaseId = metadata.purchaseId;
-        const piId = stripeId(object.payment_intent);
-        if (!refundPurchaseId && piId) {
-          try { refundPurchaseId = (await retrievePaymentIntentMetadata(config.STRIPE_SECRET_KEY, piId)).purchaseId; }
-          catch (error) {
-            request.log.error({ requestId: request.id, errorName: error instanceof Error ? error.name : 'unknown' }, 'could not resolve refunded purchase');
-            return fail(reply, 503, 'WEBHOOK_PROCESSING_FAILED');
-          }
+  app.get('/api/billing/paypal/cancel', async (_request, reply) => {
+    // Keep the pending order available for retry; PayPal does not void an un-captured order here.
+    return appBillingRedirect(reply, 'cancelled');
+  });
+
+  app.post('/api/billing/paypal/webhook', { config: { rateLimit: { max: 300, timeWindow: '1 minute' } } }, async (request, reply) => {
+    if (!paypalBillingConfigured() || !config.PAYPAL_WEBHOOK_ID) return fail(reply, 503, 'BILLING_NOT_CONFIGURED');
+    let event: PayPalWebhookEvent | null;
+    try {
+      event = await verifyPayPalWebhook(paypalCredentials()!, config.PAYPAL_WEBHOOK_ID, request.headers, request.body);
+    } catch (error) {
+      request.log.error({ requestId: request.id, errorName: error instanceof Error ? error.name : 'unknown', paypalStatus: error instanceof PayPalRequestError ? error.status : undefined }, 'PayPal webhook verification service failed');
+      return fail(reply, 503, 'WEBHOOK_VERIFICATION_UNAVAILABLE');
+    }
+    if (!event) return fail(reply, 400, 'WEBHOOK_SIGNATURE_INVALID');
+
+    let completedOrder: PayPalOrder | undefined;
+    let refundCaptureId: string | undefined;
+    let refundOrderId: string | undefined;
+    const resource = event.resource;
+    const related = asRecord(asRecord(resource.supplementary_data)?.related_ids);
+    const credentials = paypalCredentials()!;
+    try {
+      if (event.event_type === 'CHECKOUT.ORDER.APPROVED') {
+        const orderId = textValue(resource.id);
+        if (orderId) {
+          try { completedOrder = await capturePayPalOrder(credentials, orderId); }
+          catch { completedOrder = await getPayPalOrder(credentials, orderId); }
         }
-        refundPaymentIntentId = piId ?? undefined;
+      } else if (event.event_type === 'PAYMENT.CAPTURE.COMPLETED') {
+        const orderId = textValue(related?.order_id);
+        if (orderId) completedOrder = await getPayPalOrder(credentials, orderId);
+      } else if (event.event_type === 'PAYMENT.CAPTURE.REFUNDED' || event.event_type === 'PAYMENT.CAPTURE.REVERSED') {
+        refundCaptureId = textValue(related?.capture_id) ?? textValue(resource.id) ?? undefined;
+        refundOrderId = textValue(related?.order_id) ?? undefined;
       }
-      try {
-        await processStripeEvent(event, refundPurchaseId, refundPaymentIntentId);
-        return reply.code(204).send();
-      } catch (error) {
-        request.log.error({ requestId: request.id, eventId: event.id, eventType: event.type, errorName: error instanceof Error ? error.name : 'unknown' }, 'stripe webhook processing failed');
-        return fail(reply, 503, 'WEBHOOK_PROCESSING_FAILED');
-      }
-    });
+      await processPayPalWebhook(event, completedOrder, refundCaptureId, refundOrderId);
+      return reply.code(204).send();
+    } catch (error) {
+      request.log.error({ requestId: request.id, eventId: event.id, eventType: event.event_type, errorName: error instanceof Error ? error.name : 'unknown', paypalStatus: error instanceof PayPalRequestError ? error.status : undefined }, 'PayPal webhook processing failed');
+      return fail(reply, 503, 'WEBHOOK_PROCESSING_FAILED');
+    }
   });
 
   app.get('/api/families/:familyId/records', { preHandler: auth }, async (request, reply) => {
