@@ -1,7 +1,6 @@
-import { buildApp } from './app.js';
+import app from './app.js';
 import { config } from './config.js';
 
-const app = await buildApp();
 for (const signal of ['SIGINT', 'SIGTERM'] as const) {
   process.once(signal, () => { void app.close().finally(() => process.exit(0)); });
 }
