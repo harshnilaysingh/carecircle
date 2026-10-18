@@ -1,0 +1,185 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum FamilyRole {
+  OWNER
+  ADMIN
+  CAREGIVER
+  VIEWER
+}
+
+enum FamilyStatus {
+  ACTIVE
+  INACTIVE
+}
+
+enum InviteStatus {
+  PENDING
+  ACCEPTED
+  REVOKED
+  EXPIRED
+}
+
+enum PurchaseType {
+  FAMILY_BASE
+  EXTRA_SEATS
+}
+
+enum PurchaseStatus {
+  PENDING
+  COMPLETED
+  EXPIRED
+  FAILED
+  REFUNDED
+}
+
+enum RecordKind {
+  TASK
+  DAILY_UPDATE
+  CHAT_MESSAGE
+  APPOINTMENT
+  PROFILE
+  CARE_INFORMATION
+  HOUSEHOLD_INCOME
+}
+
+model User {
+  id             String            @id @default(cuid())
+  email          String            @unique @db.VarChar(320)
+  passwordHash   String            @db.VarChar(255)
+  displayName    String            @db.VarChar(120)
+  createdAt      DateTime          @default(now())
+  updatedAt      DateTime          @updatedAt
+  sessions       Session[]
+  memberships    FamilyMember[]
+  ownedFamily    Family?           @relation("FamilyOwner")
+  createdRecords CareRecord[]      @relation("RecordAuthor")
+  auditEvents    AuditEvent[]
+  invites        Invite[]          @relation("InviteCreator")
+  purchases      BillingPurchase[]
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  tokenHash String   @unique @db.Char(64)
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  @@index([userId, expiresAt])
+  @@index([expiresAt])
+}
+
+model Family {
+  id          String            @id @default(cuid())
+  name        String            @db.VarChar(120)
+  ownerId     String?           @unique
+  seatLimit   Int               @default(4)
+  status      FamilyStatus      @default(INACTIVE)
+  createdAt   DateTime          @default(now())
+  updatedAt   DateTime          @updatedAt
+  owner       User?             @relation("FamilyOwner", fields: [ownerId], references: [id], onDelete: Restrict)
+  memberships FamilyMember[]
+  invites     Invite[]
+  records     CareRecord[]
+  auditEvents AuditEvent[]
+  purchases   BillingPurchase[]
+  @@index([status])
+  @@map("families")
+}
+
+model FamilyMember {
+  id        String     @id @default(cuid())
+  familyId  String
+  userId    String     @unique
+  role      FamilyRole @default(CAREGIVER)
+  createdAt DateTime   @default(now())
+  family    Family     @relation(fields: [familyId], references: [id], onDelete: Cascade)
+  user      User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  @@unique([familyId, userId])
+  @@map("family_members")
+}
+
+model Invite {
+  id          String       @id @default(cuid())
+  familyId    String
+  email       String?      @db.VarChar(320)
+  role        FamilyRole   @default(CAREGIVER)
+  codeHash    String       @unique @db.Char(64)
+  expiresAt   DateTime
+  status      InviteStatus @default(PENDING)
+  acceptedAt  DateTime?
+  revokedAt   DateTime?
+  createdById String
+  createdAt   DateTime     @default(now())
+  family      Family       @relation(fields: [familyId], references: [id], onDelete: Cascade)
+  createdBy   User         @relation("InviteCreator", fields: [createdById], references: [id], onDelete: Restrict)
+  @@index([familyId, status, expiresAt])
+  @@index([expiresAt])
+  @@map("invites")
+}
+
+model BillingPurchase {
+  id                    String         @id @default(cuid())
+  type                  PurchaseType
+  status                PurchaseStatus @default(PENDING)
+  userId                String
+  familyId              String?
+  seatQuantity          Int
+  baseCheckoutOwnerId   String?        @unique
+  stripeCheckoutSessionId String?      @unique @db.VarChar(255)
+  stripePaymentIntentId String?        @unique @db.VarChar(255)
+  checkoutUrl           String?        @db.Text
+  checkoutExpiresAt     DateTime?
+  createdAt             DateTime       @default(now())
+  updatedAt             DateTime       @updatedAt
+  user                  User           @relation(fields: [userId], references: [id], onDelete: Restrict)
+  family                Family?        @relation(fields: [familyId], references: [id], onDelete: SetNull)
+  @@index([userId, createdAt])
+  @@index([familyId, status])
+  @@map("billing_purchases")
+}
+
+model StripeWebhookEvent {
+  id        String   @id @db.VarChar(255)
+  eventType String   @db.VarChar(120)
+  createdAt DateTime @default(now())
+  @@index([createdAt])
+  @@map("stripe_webhook_events")
+}
+
+model CareRecord {
+  id          String     @id @default(cuid())
+  familyId    String
+  kind        RecordKind
+  title       String     @db.VarChar(200)
+  data        Json
+  createdById String
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
+  family      Family     @relation(fields: [familyId], references: [id], onDelete: Cascade)
+  createdBy   User       @relation("RecordAuthor", fields: [createdById], references: [id], onDelete: Restrict)
+  @@index([familyId, kind, updatedAt])
+  @@index([familyId, createdAt])
+}
+
+model AuditEvent {
+  id          String   @id @default(cuid())
+  familyId    String?
+  actorId     String?
+  action      String   @db.VarChar(100)
+  subjectType String?  @db.VarChar(80)
+  subjectId   String?  @db.VarChar(100)
+  requestId   String?  @db.VarChar(100)
+  createdAt   DateTime @default(now())
+  family      Family?  @relation(fields: [familyId], references: [id], onDelete: SetNull)
+  actor       User?    @relation(fields: [actorId], references: [id], onDelete: SetNull)
+  @@index([familyId, createdAt])
+  @@index([actorId, createdAt])
+}

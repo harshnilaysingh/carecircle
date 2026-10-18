@@ -81,4 +81,3 @@ The existing HTML/localStorage UI was not present in this workspace, so replacin
 ## Vercel deployment
 
 This API is a conventional long-running Fastify process and is Docker-ready. A private GitHub repository named `carecircle` was created at `https://github.com/harshnilaysingh/carecircle`. A Vercel project named `carecircle` was also created with private source visibility requested and SSO protection enabled for all deployments. No deployment exists yet, and the available Vercel response did not confirm a Git connection. Provision PostgreSQL externally (or through a connected marketplace provider), set all environment variables separately per Preview/Production, and add `APP_ORIGIN` to the exact trusted origins. Run migration deploy as a controlled release step.
-
