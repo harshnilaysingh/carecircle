@@ -79,8 +79,8 @@ model Session {
 model Family {
   id          String            @id @default(cuid())
   name        String            @db.VarChar(120)
-  ownerId     String?           @unique
-  seatLimit   Int               @default(4)
+  ownerId     String?           @unique @map("owner_id")
+  seatLimit   Int               @default(4) @map("seat_limit")
   status      FamilyStatus      @default(INACTIVE)
   createdAt   DateTime          @default(now())
   updatedAt   DateTime          @updatedAt
@@ -96,8 +96,8 @@ model Family {
 
 model FamilyMember {
   id        String     @id @default(cuid())
-  familyId  String
-  userId    String     @unique
+  familyId  String     @map("family_id")
+  userId    String     @unique @map("user_id")
   role      FamilyRole @default(CAREGIVER)
   createdAt DateTime   @default(now())
   family    Family     @relation(fields: [familyId], references: [id], onDelete: Cascade)
@@ -108,11 +108,11 @@ model FamilyMember {
 
 model Invite {
   id          String       @id @default(cuid())
-  familyId    String
+  familyId    String       @map("family_id")
   email       String?      @db.VarChar(320)
   role        FamilyRole   @default(CAREGIVER)
-  codeHash    String       @unique @db.Char(64)
-  expiresAt   DateTime
+  codeHash    String       @unique @db.Char(64) @map("code_hash")
+  expiresAt   DateTime     @map("expires_at")
   status      InviteStatus @default(PENDING)
   acceptedAt  DateTime?
   revokedAt   DateTime?

@@ -1,6 +1,6 @@
 # CareCircle backend
 
-Standalone TypeScript API package prepared because no CareCircle source repository or connected deployment was available. It uses Fastify, PostgreSQL, Prisma migrations, Argon2id password hashing, opaque database-backed sessions, role-checked family workspaces, validation, request limits, security headers, and audit events. It does not include the referenced site's HTML or claim deployment.
+Standalone TypeScript API for CareCircle. The original site UI source is unavailable in this workspace, so this repository contains the Fastify/PostgreSQL backend, Prisma migrations, Argon2id password hashing, opaque database-backed sessions, role-checked family workspaces, validation, request limits, secure headers, and audit events. The UI integration and a verified full-app deployment remain pending.
 
 ## Local setup
 
@@ -9,7 +9,7 @@ Requires Node.js 22.9+, pnpm 11, PostgreSQL 15+, and Redis 7+. Copy `.env.exampl
 ```sh
 pnpm install --frozen-lockfile
 pnpm exec prisma generate
-pnpm exec prisma migrate dev --name initial
+pnpm exec prisma migrate deploy
 pnpm run dev
 ```
 
@@ -80,4 +80,4 @@ The existing HTML/localStorage UI was not present in this workspace, so replacin
 
 ## Vercel deployment
 
-This API is a conventional long-running Fastify process and is Docker-ready. The private GitHub repository `https://github.com/harshnilaysingh/carecircle` contains this backend. The private-source Vercel project `carecircle` is linked to the repository and has SSO protection enabled for all deployments. The first production build failed with `STATIC_BUILD_NO_OUT_DIR`: Vercel treated this backend-only repository as a static site and found no `public` output. No live backend is deployed. Provision PostgreSQL and the required secrets, then choose a container host or add and verify a supported Vercel function adapter before deploying. Set all environment variables separately per Preview/Production, and add `APP_ORIGIN` to the exact trusted origins. Run migration deploy as a controlled release step.
+This API is Docker-ready and now exposes the Vercel-supported Fastify entrypoint at `src/index.ts`. The GitHub repository `https://github.com/harshnilaysingh/carecircle` is public by request; the linked Vercel project `carecircle` retains SSO protection for all deployments. The earlier Vercel build failed with `STATIC_BUILD_NO_OUT_DIR` before a Fastify entrypoint was present. The new entrypoint has not yet been deployed or confirmed by Vercel. A working full-app preview still requires the original frontend source, managed PostgreSQL and Redis, Resend invitation credentials, Stripe test-mode credentials, and distinct session/invite secrets. Configure these separately for Preview and Production, set `APP_ORIGIN` to the exact frontend origin, and run migration deploy as a controlled release step. Do not put credentials in the public repository.
