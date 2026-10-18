@@ -10,6 +10,7 @@ import { Prisma, PrismaClient, BillingProvider, FamilyRole, FamilyStatus, Invite
 import { config } from './config.js';
 import { clearSessionCookie, digest, newToken, requireSameOrigin, setSessionCookie } from './security.js';
 import { capturePayPalOrder, createPayPalOrder, getPayPalOrder, PayPalRequestError, verifyPayPalWebhook, type PayPalCredentials, type PayPalOrder, type PayPalWebhookEvent } from './payments.js';
+import { careCircleHtml } from './web.js';
 
 const prisma = new PrismaClient({ log: config.NODE_ENV === 'development' ? ['warn', 'error'] : ['error'] });
 declare module 'fastify' { interface FastifyRequest { userId?: string; } }
@@ -134,6 +135,8 @@ export async function buildApp() {
     return { invite, code, inviteUrl: `${config.PUBLIC_APP_URL}/invite?code=${encodeURIComponent(code)}` };
   };
 
+  app.get('/', async (_request, reply) => reply.type('text/html; charset=utf-8').header('Cache-Control', 'no-store').send(careCircleHtml));
+  app.get('/invite', async (_request, reply) => reply.type('text/html; charset=utf-8').header('Cache-Control', 'no-store').send(careCircleHtml));
   app.get('/healthz', async () => ({ status: 'ok' }));
   app.get('/readyz', async (_request, reply) => {
     try { await prisma.$queryRaw`SELECT 1`; if (redis) await redis.ping(); return { status: 'ready' }; }
